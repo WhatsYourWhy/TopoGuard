@@ -7,16 +7,46 @@ from scipy.spatial import KDTree
 
 class TopoGuardV5:
     """
-    Topological refusal layer.
+    TopoGuardV5: Topology-gated refusal layer.
 
-    - mode="proxy": kNN-graph + cycle basis (lightweight)
-    - mode="ph": Vietoris–Rips + Wasserstein via giotto-tda
+    Modes
+    -----
+    - mode="proxy":
+        Lightweight topological proxies using:
+          * kNN graph over each windowed point cloud
+          * H0: number of connected components
+          * H1: longest cycle length (normalized by window size)
+          * D: temporal delta in (H0, H1) between consecutive windows
+        No external dependencies beyond numpy, scipy, networkx.
 
-    Public API:
-      - calibrate(stable_data): learn topological envelope
-      - detect_scalar(ts_1d): batch decision on 1D series
-      - detect_vector(X): batch decision on (T, d) multivariate data
-      - update(new_batch): streaming decision with rolling buffer
+    - mode="ph":
+        Exact persistent homology using giotto-tda:
+          * Vietoris–Rips persistence on windowed point clouds
+          * H0: count of 0-dimensional diagram points
+          * H1: maximum 1-dimensional persistence (death - birth)
+          * D: Wasserstein distance between consecutive diagrams
+        Requires: pip install giotto-tda
+
+    Public API
+    ----------
+    - calibrate(stable_data):
+        Learn topological envelopes (q99_dist, q50_circle, q10_circle)
+        from a known stable regime. Must be called before detection.
+
+    - detect_scalar(ts_1d):
+        Batch decision for 1D time series (shape: (T,)).
+        Returns (decision, circle_strength, flare_distance).
+
+    - detect_vector(x_data):
+        Batch decision for multivariate time series (shape: (T, d)).
+        Returns (decision, circle_strength, flare_distance).
+
+    - update(new_batch):
+        Streaming API. Append scalar / 1D / 2D batch to an internal
+        rolling buffer and return the latest decision once enough
+        samples are accumulated. Returns
+        (decision, circle_strength, flare_distance), where decision
+        may be "WARMUP" until sufficient data is available.
     """
 
     def __init__(self, window=200, stride=20, embed_dim=2, k=5, mode="proxy"):
@@ -36,11 +66,38 @@ class TopoGuardV5:
         if mode == "ph" and importlib.util.find_spec("gtda") is None:
             raise ImportError("giotto-tda not installed. Run: pip install giotto-tda")
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _min_samples_needed(self, arr) -> int:
+        """
+        Minimum raw samples required before we can form at least one
+        window after any embedding.
+
+        - Scalar + proxy mode:
+            We apply delay embedding of length embed_dim, then require
+            'window' embedded samples. So we need:
+                window + (embed_dim - 1) raw samples.
+
+        - All other cases (multivariate or PH mode):
+            We treat windows directly, so we need:
+                window raw samples.
+        """
+        arr = np.asarray(arr)
+        if arr.ndim == 1 and self.mode == "proxy":
+            return self.window + (self.embed_dim - 1)
+        return self.window
+
     def _embed_scalar(self, ts):
         n = len(ts) - (self.embed_dim - 1)
         if n <= 0:
             raise ValueError("Input too short for embedding dimension")
-        return np.column_stack([ts[i : i + n] for i in range(self.embed_dim)])
+        return np.column_stack([ts[i: i + n] for i in range(self.embed_dim)])
+
+    # ------------------------------------------------------------------
+    # Feature extraction
+    # ------------------------------------------------------------------
 
     def _extract_features_proxy(self, data):
         data = np.asarray(data)
@@ -49,7 +106,7 @@ class TopoGuardV5:
 
         t_steps = len(data)
         windows = [
-            data[i : i + self.window]
+            data[i: i + self.window]
             for i in range(0, t_steps - self.window + 1, self.stride)
         ]
 
@@ -82,7 +139,9 @@ class TopoGuardV5:
 
         feats = np.array(features) if features else np.zeros((0, 4))
         if feats.shape[0] == 0:
-            raise ValueError("No features extracted – increase data length or adjust window/stride")
+            raise ValueError(
+                "No features extracted – increase data length or adjust window/stride"
+            )
         return feats
 
     def _extract_features_ph(self, data):
@@ -105,12 +164,12 @@ class TopoGuardV5:
 
         feats = []
         for i, d in enumerate(diagrams):
-            h0_count = np.sum(d[:, 2] == 0) if d.shape[0] else 0
-
-            h1_mask = d[:, 2] == 1 if d.shape[0] else np.array([], dtype=bool)
-            if np.any(h1_mask):
-                h1_persist = np.max(d[h1_mask, 1] - d[h1_mask, 0])
+            if d.shape[0]:
+                h0_count = np.sum(d[:, 2] == 0)
+                h1_mask = d[:, 2] == 1
+                h1_persist = np.max(d[h1_mask, 1] - d[h1_mask, 0]) if np.any(h1_mask) else 0.0
             else:
+                h0_count = 0
                 h1_persist = 0.0
 
             dd = diagram_dists[i - 1, i] if i > 0 else 0.0
@@ -118,7 +177,9 @@ class TopoGuardV5:
 
         feats = np.array(feats) if feats else np.zeros((0, 4))
         if feats.shape[0] == 0:
-            raise ValueError("No PH features extracted – increase data length or adjust window/stride")
+            raise ValueError(
+                "No PH features extracted – increase data length or adjust window/stride"
+            )
         return feats
 
     def _extract_features(self, data):
@@ -126,18 +187,24 @@ class TopoGuardV5:
             return self._extract_features_proxy(data)
         return self._extract_features_ph(data)
 
-    def _min_samples_needed(self, arr):
-        arr = np.asarray(arr)
-        if self.mode == "proxy" and arr.ndim == 1:
-            return self.window + (self.embed_dim - 1)
-        return self.window
+    # ------------------------------------------------------------------
+    # Calibration
+    # ------------------------------------------------------------------
 
     def calibrate(self, stable_data):
+        """
+        Calibrate TopoGuardV5 on a segment known to lie in a stable regime.
+        Learns:
+          - q99_dist: 99th percentile of diagram-distance (flare envelope)
+          - q50_circle: median normalized circle strength
+          - q10_circle: 10th percentile normalized circle strength
+        """
         raw = np.asarray(stable_data)
         needed = self._min_samples_needed(raw)
         if raw.shape[0] < needed:
             raise ValueError(
-                f"Calibration data too short for configured window; need at least {needed} samples"
+                f"Calibration data too short for current window/embed configuration. "
+                f"Need at least {needed} samples, got {raw.shape[0]}."
             )
 
         feats = self._extract_features(raw)
@@ -158,6 +225,10 @@ class TopoGuardV5:
         )
         return self
 
+    # ------------------------------------------------------------------
+    # Decision policy
+    # ------------------------------------------------------------------
+
     def _make_decision(self, feats, signal_var):
         if not self.calibrated:
             raise RuntimeError("Model must be calibrated before detection")
@@ -177,6 +248,10 @@ class TopoGuardV5:
 
         return decisions, circle_str, feats[:, 2]
 
+    # ------------------------------------------------------------------
+    # Batch detection
+    # ------------------------------------------------------------------
+
     def detect_scalar(self, ts_1d):
         feats = self._extract_features(ts_1d)
         decisions, circle_str, flare_d = self._make_decision(feats, np.var(ts_1d))
@@ -195,7 +270,27 @@ class TopoGuardV5:
             flare_d[-1] if len(flare_d) else 0.0,
         )
 
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
     def update(self, new_batch):
+        """
+        Streaming update.
+
+        Append scalar / 1D / 2D batch of new samples to the internal
+        buffer and return the latest decision.
+
+        Returns
+        -------
+        decision : str
+            "WARMUP" until sufficient samples are accumulated,
+            then one of {"AUTOMATE", "INTERVENE/FLARE", "REFUSE/VOID"}.
+        circle_strength : float
+            Last-window normalized circle strength.
+        flare_distance : float
+            Last-window diagram-distance (or proxy) value.
+        """
         new_arr = np.asarray(new_batch)
         if new_arr.ndim == 0:
             new_arr = new_arr.reshape(1)
@@ -219,9 +314,13 @@ class TopoGuardV5:
                     )
                 self.buffer = np.vstack([self.buffer, new_arr])
 
+        # Trim rolling buffer to at most 2 * window worth of raw samples
         if len(self.buffer) > self.window * 2:
-            self.buffer = self.buffer[-(self.window * 2) :]
-        if len(self.buffer) < self._min_samples_needed(self.buffer):
+            self.buffer = self.buffer[-(self.window * 2):]
+
+        # Mode-aware warmup: honor scalar embedding requirements in proxy mode
+        needed = self._min_samples_needed(self.buffer)
+        if len(self.buffer) < needed:
             return "WARMUP", 0.0, 0.0
 
         feats = self._extract_features(self.buffer)
