@@ -6,6 +6,19 @@ from scipy.spatial import KDTree
 
 
 class TopoGuardV5:
+    """
+    Topological refusal layer.
+
+    - mode="proxy": kNN-graph + cycle basis (lightweight)
+    - mode="ph": Vietoris–Rips + Wasserstein via giotto-tda
+
+    Public API:
+      - calibrate(stable_data): learn topological envelope
+      - detect_scalar(ts_1d): batch decision on 1D series
+      - detect_vector(X): batch decision on (T, d) multivariate data
+      - update(new_batch): streaming decision with rolling buffer
+    """
+
     def __init__(self, window=200, stride=20, embed_dim=2, k=5, mode="proxy"):
         self.window = window
         self.stride = stride
@@ -113,10 +126,19 @@ class TopoGuardV5:
             return self._extract_features_proxy(data)
         return self._extract_features_ph(data)
 
+    def _min_samples_needed(self, arr):
+        arr = np.asarray(arr)
+        if self.mode == "proxy" and arr.ndim == 1:
+            return self.window + (self.embed_dim - 1)
+        return self.window
+
     def calibrate(self, stable_data):
         raw = np.asarray(stable_data)
-        if raw.shape[0] < self.window:
-            raise ValueError("Calibration data too short for configured window")
+        needed = self._min_samples_needed(raw)
+        if raw.shape[0] < needed:
+            raise ValueError(
+                f"Calibration data too short for configured window; need at least {needed} samples"
+            )
 
         feats = self._extract_features(raw)
         self.signal_var_ref = np.var(raw) + 1e-8
@@ -199,7 +221,7 @@ class TopoGuardV5:
 
         if len(self.buffer) > self.window * 2:
             self.buffer = self.buffer[-(self.window * 2) :]
-        if len(self.buffer) < self.window:
+        if len(self.buffer) < self._min_samples_needed(self.buffer):
             return "WARMUP", 0.0, 0.0
 
         feats = self._extract_features(self.buffer)
