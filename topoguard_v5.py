@@ -175,13 +175,27 @@ class TopoGuardV5:
 
     def update(self, new_batch):
         new_arr = np.asarray(new_batch)
-        if new_arr.ndim == 1:
-            new_arr = new_arr.reshape(-1, 1)
+        if new_arr.ndim == 0:
+            new_arr = new_arr.reshape(1)
+        elif new_arr.ndim > 2:
+            raise ValueError("new_batch must be scalar, 1D, or 2D")
 
         if self.buffer is None:
-            self.buffer = new_arr
+            self.buffer = new_arr.copy()
         else:
-            self.buffer = np.vstack([self.buffer, new_arr])
+            if self.buffer.ndim != new_arr.ndim:
+                raise ValueError(
+                    "new_batch dimensionality does not match existing stream buffer"
+                )
+
+            if self.buffer.ndim == 1:
+                self.buffer = np.concatenate([self.buffer, new_arr])
+            else:
+                if self.buffer.shape[1] != new_arr.shape[1]:
+                    raise ValueError(
+                        "new_batch feature width does not match existing stream buffer"
+                    )
+                self.buffer = np.vstack([self.buffer, new_arr])
 
         if len(self.buffer) > self.window * 2:
             self.buffer = self.buffer[-(self.window * 2) :]
