@@ -87,6 +87,16 @@ for batch in incoming_stream:
 
 ---
 
+
+## TopoGuardV5 Update Benefits
+
+Compared to earlier TopoGuardV5 revisions, this update improves production behavior in a few practical ways:
+
+- **Mode-aware warmup length** for scalar proxy streams (`window + embed_dim - 1`), preventing premature decisions before embedding has enough samples.
+- **Clearer calibration diagnostics** with explicit minimum-sample errors showing required vs observed length.
+- **More explicit API contracts** via expanded class/method documentation for calibration, batch detection, and streaming behavior.
+- **Safer streaming semantics** with strict dimensionality checks and bounded rolling buffer memory.
+
 ## Decision Policy
 
 After calibration, each window is classified by three features: **circle strength** (C), **diagram distance** (D), and **H₀ component count**.
